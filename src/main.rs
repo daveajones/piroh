@@ -8,6 +8,10 @@ use iroh_gossip::{
     proto::TopicId,
 };
 use serde::{Deserialize, Serialize};
+use std::io::Write;
+
+const FILE_AUTO_TOPIC: &str = "auto.topic";
+const FILE_NODE_SECRET_KEY: &str = "node.secret";
 
 /// Chat over iroh-gossip
 ///
@@ -46,7 +50,25 @@ async fn main() -> Result<()> {
     // parse the cli command
     let (topic, nodes) = match &args.command {
         Command::Open => {
-            let topic = TopicId::from_bytes(rand::random());
+            //If a topic save file exists, read in the bytes and create the topic
+            //from that.  Otherwise, just generate a random topic id.
+            let mut topic_bytes: [u8; 32] = rand::random();
+            match std::fs::read(FILE_AUTO_TOPIC) {
+                Ok(file_data) => {
+                    topic_bytes = file_data.try_into().unwrap();
+                }
+                Err(e) => {
+                    eprintln!("Error opening topic file: {:#?}", e);
+                }
+            }
+            let topic = TopicId::from_bytes(topic_bytes);
+
+            //We have a topic now, so save it to a file for persistence
+            let path = std::path::Path::new(FILE_AUTO_TOPIC);
+            let mut file = std::fs::File::create(path)?;
+            let _ = file.write_all(&topic_bytes);
+
+            //Give some output to the screen
             println!("> opening chat room for topic {topic}");
             (topic, vec![])
         }
@@ -57,10 +79,37 @@ async fn main() -> Result<()> {
         }
     };
 
-    let endpoint = Endpoint::builder().discovery_n0().bind().await?;
+    //If a secret key file exists, read in the bytes and create the node endpoint using
+    //that data.  If not, then create a new random secret key
+    let mut rng = rand::rngs::OsRng;
+    let mut secret_key = iroh::SecretKey::generate(&mut rng);
+    match std::fs::read(FILE_NODE_SECRET_KEY) {
+        Ok(file_data) => {
+            let file_bytes: [u8; 32] = file_data.try_into().unwrap();
+            secret_key = iroh::SecretKey::from_bytes(&file_bytes);
+        }
+        Err(e) => {
+            eprintln!("Error opening secret key file: {:#?}", e);
+        }
+    }
+
+    //Create the Iroh node endpoint
+    let endpoint = Endpoint::builder()
+        .discovery_n0()
+        .secret_key(secret_key)
+        .bind()
+        .await?;
+
+    //Save the secret key we're using so we can use it again next time when
+    //building the topic
+    let path = std::path::Path::new(FILE_NODE_SECRET_KEY);
+    let mut file_secret_key = std::fs::File::create(path)?;
+    let _ = file_secret_key.write_all(&endpoint.secret_key().to_bytes())?;
 
     println!("> our node id: {}", endpoint.node_id());
-    let gossip = Gossip::builder().spawn(endpoint.clone()).await?;
+    let gossip = Gossip::builder()
+        .spawn(endpoint.clone())
+        .await?;
 
     let router = Router::builder(endpoint.clone())
         .accept(iroh_gossip::ALPN, gossip.clone())
